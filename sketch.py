@@ -144,9 +144,9 @@ def init_weight(input_size, output_size = None):
     if output_size == None:
         return theano.shared(np.zeros(shape = [input_size]))
     else:
-        return theano.shared((np.random.randn(input_size, output_size) * np.sqrt(3 / (input_size + output_size))))
+        return theano.shared((np.random.randn(input_size, output_size) * np.sqrt(1 / (input_size + output_size))))
 
-def RMSprop(cost, params, lr=0.001, rho=0.9, epsilon=1e-6):
+def RMSprop(cost, params, lr=0.0001, rho=0.9, epsilon=1e-6):
     grads = T.grad(cost=cost, wrt=params)
     updates = []
     for p, g in zip(params, grads):
@@ -159,9 +159,9 @@ def RMSprop(cost, params, lr=0.001, rho=0.9, epsilon=1e-6):
     return updates
 
 def main():
-    latent_mean_fc = init_weight(202, 101)
-    latent_log_variance_fc = init_weight(202, 101)
-    latent_initial_fc = init_weight(101, 202)
+    latent_mean_fc = init_weight(256, 101)
+    latent_log_variance_fc = init_weight(256, 101)
+    latent_initial_fc = init_weight(101, 512)
 
     # timestep x batchsize x 5
     # we can ensure every sketch has the same amount of timesteps by padding them with [0, 0, 0, 0, 1]s
@@ -175,7 +175,7 @@ def main():
     # batchsize x 100
     gaussian_sample = T.matrix()
     
-    biLSTM = bidirectionalLSTM(5, 101, 2)
+    biLSTM = bidirectionalLSTM(5, 128, 2)
 
     forward_states, backward_states = biLSTM.process(sketch)
 
@@ -195,7 +195,7 @@ def main():
     initial_hidden = T.tanh(T.dot(latent_vector, latent_initial_fc))
     initial_cell = T.tanh(T.dot(latent_vector, latent_initial_fc))
 
-    decLSTM = decoderLSTM(5, 202)
+    decLSTM = decoderLSTM(5, 512)
 
     x_mean, y_mean, x_variance, y_variance, correlation, p_values, weightings = decLSTM.process(data = dec_sketch, latent_vector = latent_vector, initial_hidden = initial_hidden, initial_cell = initial_cell)
 
@@ -211,15 +211,15 @@ def main():
 
     # weightings is a timestep x batchsize x 10 3-tensor 
     # Once we've weighted the pdf_loss, we need to add along the last axis to get the weighted average
-    weighted_pdf_loss = T.log(T.sum(weightings * pdf_loss, axis = 2) + 1e-8)
+    weighted_pdf_loss = T.log(T.sum(weightings * pdf_loss, axis = 2))
 
     # Sum along timesteps, we're basically taking an average, but we're normalizing by a constant that will often be larger than the number of timesteps (`MAX_TIMESTEPS`)
     # resulting shape is batchsize 
     
-    weighted_pdf_loss = T.sum(weighted_pdf_loss, axis = 0)/300
+    weighted_pdf_loss = T.mean(weighted_pdf_loss, axis = 0)
 
     # average over the losses, to yield the offset loss--the loss incurred by the network predicting the offsets, or, the values of `sketch`
-    offset_loss = -T.mean(weighted_pdf_loss)
+    offset_loss = -T.mean(weighted_pdf_loss) * 10
 
     # Each of the p_values model a bernoulli distribution. We are trying to minimize the negative log loss of the predicted p_values and the real p_values:
     # log(P(p_real)) -> log(P(p_real_1) * P(p_real_2) * p(p_real_3) -> sum(log(P(p_real_x)) x: 1->3
@@ -236,16 +236,18 @@ def main():
     # Sum along timestep axis, and then take the mean
     log_loss = -T.mean(T.sum(log_loss, axis = 0))
 
-    reconstruction_loss = log_loss + offset_loss
+    reconstruction_loss = offset_loss
 
     # latent_means and latent_variances are batchsize x 100 
     latent_loss = T.mean(T.sum(-1/200 * (latent_means ** 2 + latent_variances ** 2 - T.log(latent_variances ** 2)) - .5, axis = 1), axis = 0)
 
-    total_loss = reconstruction_loss + latent_loss
+    total_loss = reconstruction_loss # + latent_loss
 
     params = [latent_mean_fc, latent_log_variance_fc, latent_initial_fc] + biLSTM.get_weights() + decLSTM.get_weights()
     updates = RMSprop(cost = total_loss, params = params)
     f = theano.function(inputs = [sketch, dec_sketch, gaussian_sample], outputs = [reconstruction_loss, x_mean, y_mean, x_variance, y_variance, correlation, p_values, weightings], updates = updates)
+
+    sample = theano.function(inputs = [sketch, dec_sketch, gaussian_sample], outputs = [x_mean, y_mean, x_variance, y_variance, correlation, p_values, weightings])
 
     train_file = open('rain.processed')
     train_set = train_file.read()
@@ -261,17 +263,95 @@ def main():
 
     target = np.array([target_d, target_d]).transpose([1, 0, 2]).astype(float)
 
-    batch[:, :, :2] /= 2.
-    target[:, :, :2] /= 2.
+    print(target[:, :, 0])
+
+
+    batch[:, :, 0] /= 20.
+    batch[:, :, 1] /= 20.
+
+    target[:, :, 0] /= 20.
+    target[:, :, 1] /= 20.
 
     print(target.shape, 'target')
     s = np.random.randn(1, 101)
 
-    for i in range (100):
+    for i in range (50):
         # We're going to use the exact same gaussian sample. If we did everything correctly, the values should be exactly the same for both batch elements
         print(f(batch, target, np.concatenate([s, s], axis = 0))[0])
        # print(f(batch, target, np.concatenate([s, s], axis = 0))[1][10][:, 1])
 
+    sampled_values = sample(batch, target, np.concatenate([s, s], axis = 0))
+    print(sampled_values[0].shape)
+    x_means = sampled_values[0][:, 0, :]
+    y_means = sampled_values[1][:, 0, :]
+    x_variance = sampled_values[2][:, 0, :]
+    y_variance = sampled_values[3][:, 0, :]
+    correlation = sampled_values[4][ :, 0, :]
+    p_values = sampled_values[5][:, 0, :]
+    weightings = sampled_values[6][:, 0, :]
+
+    x, y = [], []
+    markers = []
+    
+    for timestep in range (77):
+     #   print(weightings[timestep])
+        distribution = np.random.choice(np.arange(10), p = weightings[timestep])
+        new_marker = np.random.choice(np.arange(3), p = p_values[timestep])
+
+        one_hot = [0, 0, 0]
+        one_hot[new_marker] = 1
+
+        x_g = np.random.randn(1)
+        y_g = np.random.randn(1)
+    
+        x_offset = x_means[timestep][distribution] + x_g * x_variance[timestep][distribution]
+        y_offset = y_means[timestep][distribution] + y_variance[timestep][distribution] * correlation[timestep][distribution] * x_g + y_variance[timestep][distribution] * np.sqrt(1 - correlation[timestep][distribution] ** 2) * y_g
+
+        x.append(x_offset)
+        y.append(y_offset)
+        markers.append(one_hot)
+
+    #print(drawing1, markers)
+
+
+    import pygame
+    pygame.init()
+
+    screen = pygame.display.set_mode((1000, 1000))
+
+    base = [500, 500]
+    base2 = [500, 500]
+    prev_point = None
+    prev_point2 = None
+
+    for ts in range (77):
+        base2[0] += drawing1[ts][0]
+        base2[1] += drawing1[ts][1]
+        
+        base[0] += x[ts]
+        base[1] += y[ts]
+       # print(base)
+        base[0] = int(base[0])
+        base[1] = int(base[1])
+
+        base2[0] = int(base2[0])
+        base2[1] = int(base2[1])
+
+        if prev_point != None:
+            pygame.draw.line(screen, (100, 100, 100), prev_point, base)
+            pygame.draw.line(screen, (255, 100, 100), prev_point2, base2)
+
+        prev_point = [base[0], base[1]]
+        prev_point2 = [base2[0], base2[1]]
+        #if (markers[ts] == [0, 1, 0]):
+        if (drawing1[ts][3] == 1):
+            prev_point = None 
+            prev_point2 = None
+            pass
+            #prev_point = None
+    
+    pygame.display.flip()
+    input('')
 
 main()
 
